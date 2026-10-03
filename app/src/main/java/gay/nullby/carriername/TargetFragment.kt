@@ -46,6 +46,29 @@ class TargetFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
+        // Check/request phone state permissions needed to enumerate subscriptions
+        val perms = arrayOf(
+            android.Manifest.permission.READ_PHONE_STATE,
+            android.Manifest.permission.READ_PHONE_NUMBERS,
+        )
+        val missing = perms.filter {
+            requireContext().checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), 1001)
+            return
+        }
+        loadSubscriptions(view)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            view?.let { loadSubscriptions(it) }
+        }
+    }
+
+    private fun loadSubscriptions(view: View) {
         // Use public SubscriptionManager API instead of hidden getSubId()
         val sm = requireContext().getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
         val subs = try { sm.activeSubscriptionInfoList.orEmpty() } catch (_: Exception) { emptyList() }
@@ -112,14 +135,14 @@ class TargetFragment : Fragment() {
         val subId = if (selectedSub == 1) subId1 else subId2
         if (subId == -1) return
 
-        // Restore real ISO first, then clear all overrides (pattern from eigenlux-ai/roamer)
-        val realIso = getRealCountryIso(subId)
-        if (realIso.isNotBlank()) {
-            val restore = PersistableBundle()
-            restore.putString(CarrierConfigManager.KEY_SIM_COUNTRY_ISO_OVERRIDE_STRING, realIso)
-            overrideCarrierConfig(subId, restore)
+        try {
+            InstrumentationTrigger.trigger(requireContext(), mapOf("action" to "reset", "subId" to subId.toString()))
+            Toast.makeText(context, "Carrier config reset", Toast.LENGTH_SHORT).show()
+        } catch (t: Throwable) {
+            val cause = generateSequence(t) { it.cause }.last()
+            Log.e(TAG, "onResetName failed", cause)
+            Toast.makeText(context, "Failed: ${cause.message}", Toast.LENGTH_LONG).show()
         }
-        overrideCarrierConfig(subId, null)
     }
 
     private fun onSelectSub(id: Int) {
@@ -146,101 +169,32 @@ class TargetFragment : Fragment() {
     }
 
     /**
-     * Override carrier config using the pattern proven in eigenlux-ai/roamer:
-     * 1. Use reflection on CarrierConfigManager.overrideConfig() (hidden but stable)
-     * 2. Run within shell permission identity via Shizuku-delegated ActivityManager
-     * 3. On SecurityException, retry with override=false (some OEMs require it)
-     * 4. Call notifyConfigChangedForSubId() to force the system to pick up changes
+     * Override carrier config via PrivilegedOverrideInstrumentation (roamer pattern).
+     * Uses startInstrumentation through Shizuku to run in a shell-identity context,
+     * then startDelegateShellPermissionIdentity + CarrierConfigManager.overrideConfig().
+     * This avoids both "cannot be invoked by shell" and "requires MODIFY_PHONE_STATE" errors
+     * on Android 17.
      */
     private fun overrideCarrierConfig(subId: Int, p: PersistableBundle?) {
         try {
-            withShellPermissionIdentity {
-                val mgr = requireContext().getSystemService(Context.CARRIER_CONFIG_SERVICE) as CarrierConfigManager
-                try {
-                    callOverrideConfig(mgr, subId, p, true)
-                } catch (e: InvocationTargetException) {
-                    val cause = e.targetException ?: e
-                    if (cause is SecurityException) {
-                        // Some OEM builds reject override=true; retry with false
-                        callOverrideConfig(mgr, subId, p, false)
-                    } else {
-                        throw cause
-                    }
+            val extras = mutableMapOf("action" to "set", "subId" to subId.toString())
+            if (p?.containsKey(CarrierConfigManager.KEY_SIM_COUNTRY_ISO_OVERRIDE_STRING) == true) {
+                p.getString(CarrierConfigManager.KEY_SIM_COUNTRY_ISO_OVERRIDE_STRING)?.let {
+                    extras["iso"] = it
                 }
-                // Notify system to reload the config
-                runCatching { notifyConfigChanged(subId) }
-                    .onFailure { Log.w(TAG, "notifyConfigChanged failed (non-fatal)", it) }
             }
+            if (p?.containsKey(CarrierConfigManager.KEY_CARRIER_NAME_STRING) == true) {
+                p.getString(CarrierConfigManager.KEY_CARRIER_NAME_STRING)?.let {
+                    extras["name"] = it
+                }
+            }
+            InstrumentationTrigger.trigger(requireContext(), extras)
             Toast.makeText(context, "Carrier config updated", Toast.LENGTH_SHORT).show()
         } catch (t: Throwable) {
             val cause = generateSequence(t) { it.cause }.last()
             Log.e(TAG, "overrideCarrierConfig failed", cause)
             Toast.makeText(context, "Failed: ${cause.message}", Toast.LENGTH_LONG).show()
         }
-    }
-
-    private fun callOverrideConfig(mgr: CarrierConfigManager, subId: Int, p: PersistableBundle?, override: Boolean) {
-        val m = mgr.javaClass.getMethod(
-            "overrideConfig",
-            Int::class.javaPrimitiveType,
-            PersistableBundle::class.java,
-            Boolean::class.javaPrimitiveType,
-        )
-        try {
-            m.invoke(mgr, subId, p, override)
-        } catch (e: InvocationTargetException) {
-            throw e.targetException ?: e
-        }
-    }
-
-    /**
-     * Run a block with shell-level permissions via Shizuku-delegated ActivityManager.
-     * This is what allows calling privileged telephony APIs without being a system app.
-     */
-    private fun withShellPermissionIdentity(block: () -> Unit) {
-        val am = activityManager()
-        try {
-            try {
-                am.javaClass.getMethod(
-                    "startDelegateShellPermissionIdentity",
-                    Int::class.javaPrimitiveType,
-                    Array<String>::class.java,
-                ).invoke(am, Process.myUid(), null)
-            } catch (e: InvocationTargetException) {
-                throw e.targetException ?: e
-            }
-            block()
-        } finally {
-            runCatching {
-                am.javaClass.getMethod("stopDelegateShellPermissionIdentity").invoke(am)
-            }
-        }
-    }
-
-    /**
-     * Get IActivityManager via Shizuku binder wrapper for shell permission delegation.
-     */
-    private fun activityManager(): Any {
-        val binder = Class.forName("android.os.ServiceManager")
-            .getMethod("getService", String::class.java)
-            .invoke(null, Context.ACTIVITY_SERVICE) as IBinder
-        return Class.forName("android.app.IActivityManager\$Stub")
-            .getMethod("asInterface", IBinder::class.java)
-            .invoke(null, ShizukuBinderWrapper(binder))!!
-    }
-
-    /**
-     * Notify the carrier config system that config has changed for this subscription.
-     */
-    private fun notifyConfigChanged(subId: Int) {
-        val binder = Class.forName("android.os.ServiceManager")
-            .getMethod("getService", String::class.java)
-            .invoke(null, Context.CARRIER_CONFIG_SERVICE) as IBinder
-        val loader = Class.forName("com.android.internal.telephony.ICarrierConfigLoader\$Stub")
-            .getMethod("asInterface", IBinder::class.java)
-            .invoke(null, ShizukuBinderWrapper(binder))
-        loader.javaClass.getMethod("notifyConfigChangedForSubId", Int::class.javaPrimitiveType)
-            .invoke(loader, subId)
     }
 
     override fun onDestroyView() {
